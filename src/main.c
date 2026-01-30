@@ -1,8 +1,10 @@
 /*
  * Copyright 2025, Hiroyuki OYAMA
- *
- * SPDX-License-Identifier: BSD-3-Clause
+ * Modified 2026 by Simon BEIMEL (with assistance from Gemini, Google AI)
+ * * Improvements: Added I2S 32b output support from Elehobica, 2021
+ * and optimized DMA buffer handling for RP2350.
  */
+
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -16,12 +18,15 @@
 #include "ringbuffer.h"
 #include "tusb.h"
 #include "usb_descriptors.h"
+#include "pico/audio_i2s.h"
 
 static ringbuffer_t rx_buffer = {0};
 static ringbuffer_t tx_buffer = {0};
 
-static int32_t scratch_in[64 * sizeof(int32_t) * 2];
-static int32_t scratch_out[64 * sizeof(int32_t) * 2];
+//static int32_t scratch_in[64 * sizeof(int32_t) * 2];
+//static int32_t scratch_out[64 * sizeof(int32_t) * 2];
+static int32_t scratch_in[256];
+static int32_t scratch_out[256];
 static uint64_t frac_acc = 0;
 
 static int8_t silence_buf[AUDIO_FRAME_BYTES] = {0};
@@ -39,10 +44,78 @@ static int fx_time_index = 0;
 static bool fx_log_ready = false;
 static char scratch[1024];
 
+static audio_buffer_pool_t *ap = NULL;
+
+static void update_i2s_output(int32_t *source_buffer, size_t sample_count) {
+    if (ap == NULL) return; // Nicht abbrechen bei NULL source_buffer!
+
+    audio_buffer_t *abuf = take_audio_buffer(ap, false);
+    if (abuf != NULL) {
+        int32_t *dest = (int32_t *) abuf->buffer->bytes;
+        
+        if (source_buffer != NULL) {
+            // Normales Audio-Signal kopieren
+            memcpy(dest, source_buffer, sample_count * 2 * sizeof(int32_t));
+        } else {
+            // EXPLIZITE STILLE: Wenn kein Puffer kommt, Nullen schreiben
+            memset(dest, 0, sample_count * 2 * sizeof(int32_t));
+        }
+        
+        abuf->sample_count = sample_count;
+        give_audio_buffer(ap, abuf);
+    }
+}
+
+void init_i2s_output() {
+    // 1. Audio-Format definieren (SDK 2.1.1 kompatibel)
+    static audio_format_t fmt = {
+        .sample_freq = 48000,
+        .pcm_format = AUDIO_PCM_FORMAT_S32, 
+        .channel_count = 2
+    };
+
+    // 2. Buffer-Format für den Pool (4 Bytes pro Sample pro Kanal = 8 Bytes Stride)
+    static audio_buffer_format_t producer_format = {
+        .format = &fmt,
+        .sample_stride = 8 
+    };
+
+    // 3. Pool erstellen: 3 Buffer à 256 Samples bieten genug Puffer für USB-Jitter
+    ap = audio_new_producer_pool(&producer_format, 12, 256); 
+
+    // 4. Hardware-Konfiguration mit zwei DMA-Kanälen
+    audio_i2s_config_t config = {
+        .data_pin = 18,
+        .clock_pin_base = 16,
+        .dma_channel0 = 10,    
+        .dma_channel1 = 11,    
+        .pio_sm = 0
+    };
+
+    // 5. Setup mit zwei Formaten (In/Out) und Config
+    audio_i2s_setup(&fmt, &fmt, &config);
+    
+    // 6. Pool mit der I2S-Hardware verbinden
+    audio_i2s_connect(ap);
+
+    // 7: Anti-Plopp: Den Pool mit Stille "vorwärmen", damit der DMA beim Start Nullen findet
+    for (int i = 0; i < 64; i++) {
+        update_i2s_output(NULL, FRAME_LENGTH);
+    }
+    // Kurze Pause, damit sich die Signalleitungen elektrisch stabilisieren
+    sleep_ms(70);
+
+    audio_i2s_set_enabled(true);
+}
+
+
+
 void audio_task(void) {
     uint32_t sampling_rate;
     uint8_t bit_rate;
     uint8_t channels;
+    static uint32_t silence_counter = 0;
+
     usb_audio_get_config(&sampling_rate, &bit_rate, &channels);
     if (sampling_rate != current_sampling_rate) {
         current_sampling_rate = sampling_rate;
@@ -54,12 +127,24 @@ void audio_task(void) {
     const size_t rx_samples = FRAME_LENGTH * 2;
     const size_t frame_bytes = FRAME_LENGTH * sizeof(int32_t) * 2;
     if (ringbuffer_size(&rx_buffer) >= rx_samples) {
+        silence_counter = 0; // Wir haben wieder Daten
         ringbuffer_pop(&rx_buffer, scratch_in, rx_samples);
 
         fx_process(scratch_out, scratch_in, FRAME_LENGTH);
 
         ringbuffer_push(&tx_buffer, scratch_out, rx_samples);
+
+        update_i2s_output(scratch_out, FRAME_LENGTH);
+    } else {
+        // WICHTIG: Wenn keine USB-Daten da sind, sende Stille an I2S
+        // Das verhindert, dass der DMA im Kreis dreht oder Müll spielt.
+        silence_counter++;
+        if (silence_counter > 500) { // ca. 500ms Stille abwarten
+            update_i2s_output(NULL, FRAME_LENGTH); 
+            if (silence_counter > 1000) silence_counter = 501; 
+        }
     }
+
 }
 
 void led_task(void) { led_update(); }
@@ -129,6 +214,7 @@ int main(void) {
     board_init_after_tusb();
 
     fx_init();
+    init_i2s_output();
 
     while (1) {
         tud_task();
